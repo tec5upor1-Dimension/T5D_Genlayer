@@ -81,17 +81,29 @@ def test_only_respondent_can_respond(env):
 
 
 @pytest.mark.parametrize(
-    "score,verdict",
-    [(95, "FULFILLED"), (70, "FULFILLED"), (50, "PARTIAL"), (31, "PARTIAL"), (30, "NOT_FULFILLED"), (5, "NOT_FULFILLED")],
+    "raw,bucket,verdict",
+    [
+        (100, 100, "FULFILLED"),
+        (95, 100, "FULFILLED"),
+        (88, 100, "FULFILLED"),
+        (87, 75, "PARTIAL"),
+        (70, 75, "PARTIAL"),
+        (50, 50, "PARTIAL"),
+        (31, 25, "PARTIAL"),
+        (13, 25, "PARTIAL"),
+        (12, 0, "NOT_FULFILLED"),
+        (5, 0, "NOT_FULFILLED"),
+        (0, 0, "NOT_FULFILLED"),
+    ],
 )
-def test_resolve_maps_score_to_verdict(env, score, verdict):
+def test_resolve_snaps_score_to_payout_bucket(env, raw, bucket, verdict):
     vm, c, _, respondent, _ = env
     case_id = open_case(vm, c, respondent)
     vm.mock_web("example.com", {"status": 200, "body": "refund evidence page"})
-    vm.mock_llm(".*", llm_json(score, "because"))
+    vm.mock_llm(".*", llm_json(raw, "because"))
     result = c.resolve(case_id)
     assert result["verdict"] == verdict
-    assert result["score"] == score
+    assert result["score"] == bucket
     stored = c.get_case(case_id)
     assert stored["status"] == "RESOLVED"
     assert stored["verdict"] == verdict
@@ -117,7 +129,7 @@ def test_unfetchable_evidence_does_not_crash(env):
     vm, c, _, respondent, _ = env
     case_id = open_case(vm, c, respondent)
     vm.mock_web("example.com", {"status": 500, "body": ""})
-    vm.mock_llm(".*", llm_json(20))
+    vm.mock_llm(".*", llm_json(5))
     assert c.resolve(case_id)["verdict"] == "NOT_FULFILLED"
 
 
@@ -128,9 +140,9 @@ def test_prompt_marks_inputs_as_untrusted_data(env):
     seen = {}
 
     # Pattern-matched mock: only returns a score if the guardrail wording is present.
-    vm.mock_llm(r"(?s)UNTRUSTED DATA.*<claim>.*IGNORE ALL RULES.*</claim>", llm_json(10))
+    vm.mock_llm(r"(?s)UNTRUSTED DATA.*<claim>.*IGNORE ALL RULES.*</claim>", llm_json(40))
     result = c.resolve(case_id)
-    assert result["score"] == 10, "injected claim must be wrapped in <claim> tags under the untrusted-data preamble"
+    assert result["score"] == 50, "injected claim must be wrapped in <claim> tags under the untrusted-data preamble"
 
 
 # ----- validator side of consensus -------------------------------------------------
@@ -144,27 +156,53 @@ def _resolve_for_validator(env, score=85):
     return vm
 
 
-def test_validator_accepts_close_score_same_band(env):
+def leader_json(score, verdict):
+    return json.dumps({"score": score, "verdict": verdict, "reasoning": "x"}, sort_keys=True)
+
+
+def test_validator_accepts_identical_bucket(env):
+    vm = _resolve_for_validator(env, 85)  # snaps to 75 / PARTIAL
+    assert vm.run_validator(leader_result=leader_json(75, "PARTIAL")) is True
+
+
+def test_validator_rejects_adjacent_bucket_same_verdict(env):
+    # 75 vs 50 are both PARTIAL but pay the respondent different amounts: must be rejected.
     vm = _resolve_for_validator(env, 85)
-    leader = json.dumps({"score": 80, "verdict": "FULFILLED", "reasoning": "x"}, sort_keys=True)
-    assert vm.run_validator(leader_result=leader) is True
+    assert vm.run_validator(leader_result=leader_json(50, "PARTIAL")) is False
+    assert vm.run_validator(leader_result=leader_json(25, "PARTIAL")) is False
 
 
-def test_validator_rejects_different_band(env):
+def test_validator_rejects_different_verdict(env):
     vm = _resolve_for_validator(env, 85)
-    leader = json.dumps({"score": 10, "verdict": "NOT_FULFILLED", "reasoning": "x"}, sort_keys=True)
-    assert vm.run_validator(leader_result=leader) is False
+    assert vm.run_validator(leader_result=leader_json(0, "NOT_FULFILLED")) is False
+    assert vm.run_validator(leader_result=leader_json(100, "FULFILLED")) is False
 
 
-def test_validator_rejects_far_score_in_same_band(env):
-    vm = _resolve_for_validator(env, 100)
-    leader = json.dumps({"score": 71, "verdict": "FULFILLED", "reasoning": "x"}, sort_keys=True)
-    assert vm.run_validator(leader_result=leader) is False
+def test_validator_rejects_off_bucket_score(env):
+    vm = _resolve_for_validator(env, 85)
+    # 80 is not a payout bucket, even though it is close to 75.
+    assert vm.run_validator(leader_result=leader_json(80, "PARTIAL")) is False
+
+
+def test_validator_rejects_verdict_inconsistent_with_bucket(env):
+    vm = _resolve_for_validator(env, 85)
+    assert vm.run_validator(leader_result=leader_json(75, "FULFILLED")) is False
 
 
 def test_validator_rejects_leader_error(env):
     vm = _resolve_for_validator(env, 85)
     assert vm.run_validator(leader_error=Exception("boom")) is False
+
+
+def test_nearby_raw_scores_in_one_bucket_pay_identically(env):
+    # Different raw LLM scores that snap to the same bucket produce the same payout.
+    vm, c, _, respondent, _ = env
+    payouts = set()
+    for raw in (63, 70, 75, 80, 87):
+        case_id = open_funded_case(vm, c, respondent, 1000)
+        vm.mock_llm(".*", llm_json(raw))
+        payouts.add(c.resolve(case_id)["paid_to_respondent"])
+    assert payouts == {750}
 
 
 # ----- escrow settlement ---------------------------------------------------------
@@ -181,12 +219,12 @@ def open_funded_case(vm, contract, respondent, amount):
 @pytest.mark.parametrize(
     "amount,score,paid,refund",
     [
-        (1000, 95, 1000, 0),     # FULFILLED: all to respondent
-        (1000, 70, 1000, 0),     # boundary
-        (1000, 40, 400, 600),    # PARTIAL: proportional split
-        (1001, 33, 330, 671),    # odd amount: integer math, nothing lost
-        (1000, 31, 310, 690),    # lowest PARTIAL
-        (1000, 30, 0, 1000),     # NOT_FULFILLED: full refund
+        (1000, 95, 1000, 0),     # bucket 100 (FULFILLED): all to respondent
+        (1000, 70, 750, 250),    # bucket 75
+        (1000, 40, 500, 500),    # bucket 50
+        (1001, 50, 500, 501),    # odd amount: integer math, nothing lost
+        (1001, 33, 250, 751),    # bucket 25, odd amount
+        (1000, 12, 0, 1000),     # bucket 0 (NOT_FULFILLED): full refund
         (1000, 0, 0, 1000),
     ],
 )
@@ -221,4 +259,4 @@ def test_escrow_cannot_be_settled_twice(env):
     c.resolve(case_id)
     with vm.expect_revert("already resolved"):
         c.resolve(case_id)
-    assert c.get_case(case_id)["paid_to_respondent"] == 500
+    assert c.get_case(case_id)["paid_to_respondent"] == 375  # bucket 75 of 500
