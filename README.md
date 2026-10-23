@@ -117,7 +117,26 @@ payouts are asserted through the contract's own accounting; check real transfers
 - Evidence categories: separate URLs for claimant and respondent with different weighting.
 - Hook it to an ERC-8004 agent identity or an x402 payment receipt as evidence.
 
+## Deployment (GenLayer Rally TestNet)
+
+| | |
+|---|---|
+| Contract | `0x6928ae0A7f85416F9839472b9f780713b6cd44eF` ([explorer](https://explorer-rally-testnet.genlayer.com/address/0x6928ae0A7f85416F9839472b9f780713b6cd44eF)) |
+| Source | `contracts/support_dispute_resolver.py` at commit `db1f0446a09e9486dc6011b971066bb94c910a6f` |
+| Deploy tx | [`0xe0a85003…44cefe6e`](https://explorer-rally-testnet.genlayer.com/tx/0xe0a850038aa369797dd609f0d8178ef4ed5652039d7fd71fdd5e2de544cefe6e) |
+
+Live runs on this deployment (escrow of 2 GEN each):
+
+1. **Fail closed.** Case 1 pointed at a GitHub HTML page whose text does not document the promise.
+   `resolve` ([tx](https://explorer-rally-testnet.genlayer.com/tx/0x48f383987246b1347dc0f9989619d61bce7b1d5e4435f1e4aea52cf56ced0007))
+   rolled back with `EVIDENCE_INSUFFICIENT` and consensus accepted the rollback. The case stayed
+   `OPEN`, `settled: false`, and the 2 GEN escrow was untouched.
+2. **Settled from evidence.** Case 2 pointed at the raw README text.
+   `resolve` ([tx](https://explorer-rally-testnet.genlayer.com/tx/0x7d707cdf4463b971d7b69db7857d42802729a7f8b7ea4101d1c9575dad6f285f))
+   returned `FULFILLED`, score 100, and `get_case` shows `paid_to_respondent` = 2 GEN,
+   `refunded_to_claimant` = 0, `settled: true`.
+
 ## Status
 
 Written against the current GenLayer docs. Verified locally: `genvm-lint check` passes
-(lint and validation) and all 53 direct-mode tests pass.
+(lint and validation) all 53 direct-mode tests pass, and the contract is deployed and exercised on Rally TestNet (see above).
