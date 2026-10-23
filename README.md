@@ -1,10 +1,11 @@
 # Support Dispute Resolver — a GenLayer Intelligent Contract
 
 A small, forkable template for **service-promise disputes** judged by GenLayer validators.
-A user (or an agent) states what was promised, what went wrong, and links evidence. The
-provider can respond. Validators, each running a different LLM, read the promise, the claim,
-the response and the evidence pages, and agree on how much of the promise was kept, as one of
-five payout buckets. The contract turns that bucket into a verdict and an exact escrow split.
+A user (or an agent) states what was promised, what went wrong, and **links public evidence**.
+The provider can respond. Validators, each running a different LLM, fetch and read the evidence
+pages and agree on how much of the promise was kept, as one of five payout buckets. The contract
+turns that bucket into a verdict and an exact escrow split. **If the evidence cannot be
+fetched, or is not enough to decide, nothing is settled** (see "Fail closed" below).
 
 This is the "support ticket" shape of the problems GenLayer's showcased use cases solve
 (Internet Court, Collective Memory): *did the thing that was promised actually happen?*
@@ -13,8 +14,8 @@ This is the "support ticket" shape of the problems GenLayer's showcased use case
 
 | Step | Method | Who |
 |------|--------|-----|
-| 1 | `open_case(respondent, promise, claim, evidence_url)` (payable: attached GEN is escrowed) | claimant |
-| 2 | `respond(case_id, response, evidence_url)` (optional) | respondent only |
+| 1 | `open_case(respondent, promise, claim, evidence_url)` (payable: attached GEN is escrowed; `evidence_url` is **required**, `https://`) | claimant |
+| 2 | `respond(case_id, response, evidence_url)` (optional; any evidence URL given must load too) | respondent only |
 | 3 | `resolve(case_id)` | anyone |
 | read | `get_case(case_id)`, `get_case_count()` | anyone |
 
@@ -26,6 +27,24 @@ of 0, 25, 50, 75 or 100 (its raw answer is snapped to the nearest bucket):
 | 100 | `FULFILLED` | 100% of escrow |
 | 25, 50, 75 | `PARTIAL` | 25%, 50% or 75% |
 | 0 | `NOT_FULFILLED` | 0% (full refund) |
+
+## Fail closed: evidence or no settlement
+
+Claims and responses are written by interested parties, so they are treated as unverified
+allegations. The outcome rests only on the evidence pages, and `resolve` **reverts** (no state
+change, no payout, escrow stays in the case) unless all of these hold:
+
+- the claimant gave an `https://` evidence URL when opening the case (it is required);
+- every evidence page (claimant's and, if given, respondent's) was fetched with HTTP 200 and
+  contains at least 40 characters of readable text, otherwise `EVIDENCE_UNAVAILABLE`;
+- the adjudicator explicitly reports `"evidence_sufficient": true` (a strict boolean),
+  otherwise `EVIDENCE_INSUFFICIENT`.
+
+Validators fail closed together. If the leader fails, a validator agrees only if it fails for
+the **same reason** on its own fetch; a validator that can fetch and judge the evidence rejects
+the leader's failure, so a leader cannot falsely block a resolvable case. A leader result is
+likewise rejected if the validator cannot fetch the evidence or finds it insufficient. A case
+that failed closed can be resolved later, once the evidence is reachable.
 
 ## Escrow
 
@@ -66,8 +85,8 @@ escalates disputed results through larger validator sets at the protocol level.
   `https://`, and output is forced to strict JSON that is parsed and clamped.
 - **Side effects after consensus.** All storage writes happen after `run_nondet_unsafe`
   returns, as GenVM requires.
-- **Graceful evidence failure.** An unreachable URL becomes "(could not be fetched)" instead
-  of aborting the case.
+- **Evidence is mandatory.** There is no fallback that lets the model decide without pages it
+  actually read; missing or unreadable evidence aborts the resolution.
 
 ## Run the tests (no network needed)
 
@@ -78,14 +97,16 @@ pytest tests/direct -v
 
 Tests use direct mode with mocked web and LLM calls, cover escrow payouts, and exercise the
 validator path (`vm.run_validator`), including that an adjacent payout bucket, an off-bucket
-score, or a verdict that contradicts its bucket are all rejected. Direct mode does not record outgoing transfers, so
+score, or a verdict that contradicts its bucket are all rejected, and that missing, unreachable,
+empty, too-short or insufficient evidence leaves the escrow untouched. Direct mode does not record outgoing transfers, so
 payouts are asserted through the contract's own accounting; check real transfers in Studio.
 
 ## Try it in GenLayer Studio
 
 1. Open https://studio.genlayer.com and load `contracts/support_dispute_resolver.py`.
 2. Deploy (no constructor arguments).
-3. Call `open_case` with a respondent address, a promise, a claim and an `https://` evidence URL.
+3. Call `open_case` with a respondent address, a promise, a claim and a **public `https://`
+   evidence URL that returns real text** (the evidence is mandatory).
 4. Optionally call `respond` from the respondent account.
 5. Call `resolve` and read the result with `get_case`.
 
@@ -99,25 +120,4 @@ payouts are asserted through the contract's own accounting; check real transfers
 ## Status
 
 Written against the current GenLayer docs. Verified locally: `genvm-lint check` passes
-(lint and validation) and all 35 direct-mode tests pass.
-
-**Deployed to the GenLayer Rally TestNet** (2026-10-21) from the exact source in
-`contracts/support_dispute_resolver.py`, then exercised end to end with a funded case.
-
-| Item | Value |
-|------|-------|
-| Network | GenLayer Rally TestNet |
-| Contract address | `0x2912872ad4C243023415C130E15F19797edDCfa3` |
-
-Test case run on the deployed contract (`open_case` with 2 GEN attached, a second account as
-respondent, no response and no evidence, then `resolve`):
-
-| Field | Result |
-|-------|--------|
-| `status` | `RESOLVED` |
-| `verdict` | `NOT_FULFILLED` |
-| `score` (payout bucket) | `0` |
-| `escrow` | `2000000000000000000` (2 GEN) |
-| `paid_to_respondent` | `0` |
-| `refunded_to_claimant` | `2000000000000000000` |
-| `settled` | `true` |
+(lint and validation) and all 53 direct-mode tests pass.
