@@ -165,9 +165,13 @@ Live recovery run on this deployment (1 GEN escrow, evidence URL that always ret
 4. A second `recover` was rejected with `case already recovered`
    ([tx](https://explorer-rally-testnet.genlayer.com/tx/0x8e3faaca15765dd8dcbc50c21dece02e36d3e7698d65746bf35850409b407aae)).
 
-An earlier deployment of the evidence-based settlement path (without recovery) also settled a case
-from real evidence (`FULFILLED`, full escrow to the respondent); the `resolve` logic is the same
-(now sharing a `judge` helper) and is covered by the direct-mode tests.
+Live evidence-based settlement on this same deployment (1 GEN escrow, evidence = this README at commit `5a9d2b9`, claim "the README was not published"):
+
+1. `open_case` with 1 GEN, case 2 ([tx](https://explorer-rally-testnet.genlayer.com/tx/0x1b90389e61c81db3635749c8f92d883142186db0e0c3a886c8b87e2be50d0e48)).
+2. `resolve` ([tx](https://explorer-rally-testnet.genlayer.com/tx/0x68b14e1ef748f414236c80e0f8f7f43cb62e2d6d8c98878f16caee83371afaa5)): validators fetched the evidence and agreed on bucket 100 (`FULFILLED`); `get_case` showed `paid_to_respondent` = 1 GEN, `failed_checks: 0`.
+3. A second `resolve` on the settled case was rejected, so nothing was paid twice ([tx](https://explorer-rally-testnet.genlayer.com/tx/0x4c86d0767e838a37802023b770408fc956a1c8d1b428414a3fc5499ae41d95c0)).
+
+An earlier deployment (without recovery) also settled a case from real evidence; the `resolve` logic is unchanged here.
 
 ## Status
 
