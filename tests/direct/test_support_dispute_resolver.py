@@ -399,3 +399,231 @@ def test_escrow_cannot_be_settled_twice(env):
     with vm.expect_revert("already resolved"):
         c.resolve(case_id)
     assert c.get_case(case_id)["paid_to_respondent"] == 375  # bucket 75 of 500
+
+
+# ----- escrow recovery: permanently broken evidence must not lock funds ----------------
+
+THRESHOLD = 3
+
+
+def respond_with_evidence(vm, c, respondent, case_id):
+    with vm.prank(respondent):
+        c.respond(case_id, "I sent the refund.", RESPONSE_EVIDENCE)
+
+
+def break_respondent_url(vm):
+    mock_pages(vm, response_status=404)  # claimant page fine, respondent page always 404s
+    vm.mock_llm(".*", llm_json(100))
+
+
+def make_insufficient(vm):
+    mock_pages(vm)
+    vm.mock_llm(".*", llm_json(100, sufficient=False))
+
+
+def assert_recovered(c, case_id, amount):
+    stored = c.get_case(case_id)
+    assert stored["status"] == "RECOVERED"
+    assert stored["settled"] is True
+    assert stored["escrow"] == amount
+    assert stored["refunded_to_claimant"] == amount  # the FULL balance
+    assert stored["paid_to_respondent"] == 0  # recovery never pays the respondent
+
+
+def test_blocking_respondent_url_cannot_lock_escrow_forever(env):
+    vm, c, _, respondent, _ = env
+    case_id = open_funded_case(vm, c, respondent, 1000)
+    respond_with_evidence(vm, c, respondent, case_id)
+    break_respondent_url(vm)
+
+    # resolve keeps failing closed, and the URL cannot be changed (respond is one-shot)...
+    with vm.expect_revert("EVIDENCE_UNAVAILABLE"):
+        c.resolve(case_id)
+    with vm.prank(respondent):
+        with vm.expect_revert("not open for a response"):
+            c.respond(case_id, "new", "https://example.com/evidence/other")
+
+    # ...but the claimant can recover without the respondent doing anything.
+    for expected in (1, 2, 3):
+        out = c.report_evidence_failure(case_id)
+        assert out["status"] == "EVIDENCE_UNAVAILABLE"
+        assert out["failed_checks"] == expected
+        assert out["recoverable"] is (expected >= THRESHOLD)
+        assert c.get_case(case_id)["escrow"] == 1000  # reporting never moves funds
+    result = c.recover(case_id)
+    assert result == {"status": "RECOVERED", "paid_to_respondent": 0, "refunded_to_claimant": 1000}
+    assert_recovered(c, case_id, 1000)
+    assert c.get_case(case_id)["last_failure"] == "EVIDENCE_UNAVAILABLE"
+
+
+def test_permanently_insufficient_evidence_is_recoverable(env):
+    vm, c, _, respondent, _ = env
+    case_id = open_funded_case(vm, c, respondent, 1000)
+    make_insufficient(vm)
+    with vm.expect_revert("EVIDENCE_INSUFFICIENT"):
+        c.resolve(case_id)
+    for _ in range(THRESHOLD):
+        assert c.report_evidence_failure(case_id)["status"] == "EVIDENCE_INSUFFICIENT"
+    c.recover(case_id)
+    assert_recovered(c, case_id, 1000)
+    assert c.get_case(case_id)["last_failure"] == "EVIDENCE_INSUFFICIENT"
+
+
+def test_either_party_can_trigger_recovery_and_the_claimant_gets_the_money(env):
+    vm, c, _, respondent, _ = env
+    case_id = open_funded_case(vm, c, respondent, 1000)
+    respond_with_evidence(vm, c, respondent, case_id)
+    break_respondent_url(vm)
+    with vm.prank(respondent):
+        for _ in range(THRESHOLD):
+            c.report_evidence_failure(case_id)
+        c.recover(case_id)
+    assert_recovered(c, case_id, 1000)  # refunded to the claimant, never to the respondent
+
+
+def test_recovery_is_not_available_before_the_threshold(env):
+    vm, c, _, respondent, _ = env
+    case_id = open_funded_case(vm, c, respondent, 1000)
+    make_insufficient(vm)
+    with vm.expect_revert("consecutive confirmed evidence failures"):
+        c.recover(case_id)  # nothing reported yet
+    for _ in range(THRESHOLD - 1):
+        c.report_evidence_failure(case_id)
+    with vm.expect_revert("consecutive confirmed evidence failures"):
+        c.recover(case_id)
+    assert c.get_case(case_id)["status"] == "OPEN"
+    assert c.get_case(case_id)["settled"] is False
+
+
+def test_only_parties_can_report_or_recover(env):
+    vm, c, _, respondent, stranger = env
+    case_id = open_funded_case(vm, c, respondent, 1000)
+    make_insufficient(vm)
+    with vm.prank(stranger):
+        with vm.expect_revert("only the claimant or respondent"):
+            c.report_evidence_failure(case_id)
+    for _ in range(THRESHOLD):
+        c.report_evidence_failure(case_id)
+    with vm.prank(stranger):
+        with vm.expect_revert("only the claimant or respondent"):
+            c.recover(case_id)
+    assert c.get_case(case_id)["status"] == "OPEN"
+
+
+def test_working_evidence_resets_the_failure_count(env):
+    vm, c, _, respondent, _ = env
+    case_id = open_funded_case(vm, c, respondent, 1000)
+    make_insufficient(vm)
+    c.report_evidence_failure(case_id)
+    c.report_evidence_failure(case_id)
+    assert c.get_case(case_id)["failed_checks"] == 2
+    mock_pages(vm)  # a transient outage ended
+    vm.mock_llm(".*", llm_json(100))
+    out = c.report_evidence_failure(case_id)
+    assert out["status"] == "OK" and out["failed_checks"] == 0 and out["recoverable"] is False
+    make_insufficient(vm)
+    c.report_evidence_failure(case_id)
+    with vm.expect_revert("consecutive confirmed evidence failures"):
+        c.recover(case_id)  # the earlier two failures no longer count
+
+
+def test_recovery_returns_exact_odd_balance_and_zero_value_cases_close(env):
+    vm, c, _, respondent, _ = env
+    odd = open_funded_case(vm, c, respondent, 1001)
+    empty = open_case(vm, c, respondent)
+    make_insufficient(vm)
+    for case_id in (odd, empty):
+        for _ in range(THRESHOLD):
+            c.report_evidence_failure(case_id)
+        c.recover(case_id)
+    assert_recovered(c, odd, 1001)
+    assert_recovered(c, empty, 0)
+
+
+# ----- no double release ---------------------------------------------------------------
+
+
+def test_repeat_recovery_is_rejected(env):
+    vm, c, _, respondent, _ = env
+    case_id = open_funded_case(vm, c, respondent, 1000)
+    make_insufficient(vm)
+    for _ in range(THRESHOLD):
+        c.report_evidence_failure(case_id)
+    c.recover(case_id)
+    with vm.expect_revert("already recovered"):
+        c.recover(case_id)
+    with vm.prank(respondent):
+        with vm.expect_revert("already recovered"):
+            c.recover(case_id)
+    assert_recovered(c, case_id, 1000)  # accounting did not change
+
+
+def test_resolve_after_recovery_is_rejected_even_when_evidence_returns(env):
+    vm, c, _, respondent, _ = env
+    case_id = open_funded_case(vm, c, respondent, 1000)
+    make_insufficient(vm)
+    for _ in range(THRESHOLD):
+        c.report_evidence_failure(case_id)
+    c.recover(case_id)
+    mock_pages(vm)  # evidence now loads and the adjudicator would pay the respondent in full
+    vm.mock_llm(".*", llm_json(100))
+    with vm.expect_revert("already recovered"):
+        c.resolve(case_id)
+    with vm.expect_revert("already recovered"):
+        c.report_evidence_failure(case_id)
+    assert_recovered(c, case_id, 1000)
+
+
+def test_recovery_after_settlement_is_rejected(env):
+    vm, c, _, respondent, _ = env
+    case_id = open_funded_case(vm, c, respondent, 1000)
+    make_insufficient(vm)
+    for _ in range(THRESHOLD):
+        c.report_evidence_failure(case_id)
+    mock_pages(vm)  # evidence comes back before anyone recovers
+    vm.mock_llm(".*", llm_json(100))
+    assert c.resolve(case_id)["paid_to_respondent"] == 1000
+    with vm.expect_revert("already resolved"):
+        c.recover(case_id)
+    with vm.expect_revert("already resolved"):
+        c.report_evidence_failure(case_id)
+    stored = c.get_case(case_id)
+    assert stored["paid_to_respondent"] == 1000 and stored["refunded_to_claimant"] == 0
+
+
+# ----- validators bind the exact failure reason that unlocks recovery ------------------
+
+
+def _report_for_validator(env, insufficient=True):
+    vm, c, _, respondent, _ = env
+    case_id = open_case(vm, c, respondent)
+    make_insufficient(vm) if insufficient else mock_pages(vm)
+    c.report_evidence_failure(case_id)
+    return vm
+
+
+def status_json(status):
+    return json.dumps({"status": status})
+
+
+def test_report_validator_accepts_same_failure_reason(env):
+    vm = _report_for_validator(env)
+    assert vm.run_validator(leader_result=status_json("EVIDENCE_INSUFFICIENT")) is True
+
+
+def test_report_validator_rejects_a_different_or_made_up_reason(env):
+    vm = _report_for_validator(env)
+    assert vm.run_validator(leader_result=status_json("EVIDENCE_UNAVAILABLE")) is False
+    assert vm.run_validator(leader_result=status_json("OK")) is False
+    assert vm.run_validator(leader_result=status_json("WHATEVER")) is False
+    assert vm.run_validator(leader_error=Exception("boom")) is False
+
+
+def test_report_validator_rejects_a_false_failure_report(env):
+    # Evidence is fine for this validator, so a leader claiming it is unavailable is refused.
+    vm, c, _, respondent, _ = env
+    case_id = open_case(vm, c, respondent)
+    vm.mock_llm(".*", llm_json(100))
+    c.report_evidence_failure(case_id)  # consensus on this run: OK
+    assert vm.run_validator(leader_result=status_json("EVIDENCE_UNAVAILABLE")) is False
+    assert vm.run_validator(leader_result=status_json("OK")) is True
